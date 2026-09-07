@@ -1,0 +1,134 @@
+name: Spin iOS Unsigned Archive
+run-name: spin-ios-unsigned-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact current rune-spin main SHA verified by Jenkins
+        required: true
+        type: string
+      build_number:
+        description: Jenkins build number
+        required: true
+        type: string
+      request_id:
+        description: Unpredictable Jenkins request identity
+        required: true
+        type: string
+      source_cipher_sha256:
+        description: SHA-256 of the encrypted source archive
+        required: true
+        type: string
+      source_plain_sha256:
+        description: SHA-256 of the decrypted source archive
+        required: true
+        type: string
+      source_key_hex:
+        description: One-time AES-256-GCM key; ciphertext is published only after this exact run is verified
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-archive:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TRUSTED_GITHUB_MERGER: KorStrix
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      TEAM_ID: V2GZJ6C3RZ
+      BUNDLE_ID: com.yjsgames.spin
+      BUILD_COMMIT: ${{ inputs.commit_sha }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+      REQUEST_ID: ${{ inputs.request_id }}
+      SOURCE_CIPHER_SHA256: ${{ inputs.source_cipher_sha256 }}
+      SOURCE_PLAIN_SHA256: ${{ inputs.source_plain_sha256 }}
+      VITE_FIREBASE_ANALYTICS_ENABLED: "false"
+      VITE_FIREBASE_API_KEY: AIzaSyBgeZX8b_1dPgejRWQBOYV7BWPq9ZsdCIo
+      VITE_FIREBASE_AUTH_DOMAIN: spin-game-services-221126.firebaseapp.com
+      VITE_FIREBASE_PROJECT_ID: spin-game-services-221126
+      VITE_FIREBASE_APP_ID: 1:289090959480:web:fd37d951d9a0e59946d58d
+      VITE_FIREBASE_MESSAGING_SENDER_ID: "289090959480"
+    steps:
+      - name: Validate request identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v1
+          test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
+          case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
+          test "${#BUILD_COMMIT}" = 40
+          case "$BUILD_NUMBER" in ''|*[!0-9]*) exit 64 ;; esac
+          case "$REQUEST_ID" in ''|*[!A-Za-z0-9._-]*) exit 64 ;; esac
+          case "$SOURCE_CIPHER_SHA256" in ''|*[!0-9a-f]*) exit 64 ;; esac
+          case "$SOURCE_PLAIN_SHA256" in ''|*[!0-9a-f]*) exit 64 ;; esac
+          test "${#SOURCE_CIPHER_SHA256}" = 64
+          test "${#SOURCE_PLAIN_SHA256}" = 64
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: Wait for, verify and decrypt exact source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_KEY_HEX: ${{ inputs.source_key_hex }}
+        run: |
+          set -euo pipefail
+          set +x
+          echo "::add-mask::$SOURCE_KEY_HEX"
+          case "$SOURCE_KEY_HEX" in ''|*[!0-9a-f]*) exit 64 ;; esac
+          test "${#SOURCE_KEY_HEX}" = 64
+          release_tag="spin-ios-source-$REQUEST_ID"
+          asset_name="$release_tag.tar.gz.enc"
+          asset_url=''
+          for attempt in $(seq 1 120); do
+            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > source-release.json 2>/dev/null || true
+            asset_url="$(RELEASE_TAG="$release_tag" ASSET_NAME="$asset_name" node -e 'const fs=require("fs"); if(!fs.existsSync("source-release.json")) process.exit(0); const value=JSON.parse(fs.readFileSync("source-release.json","utf8")||"{}"); if(value.draft===false&&value.prerelease===true&&value.tag_name===process.env.RELEASE_TAG&&value.name===process.env.RELEASE_TAG){const matches=(value.assets||[]).filter((v)=>v.name===process.env.ASSET_NAME&&v.state==="uploaded"); if(matches.length>1) throw new Error("duplicate encrypted source assets"); if(matches.length===1) process.stdout.write(matches[0].browser_download_url);}')"
+            [ -n "$asset_url" ] && break
+            sleep 5
+          done
+          case "$asset_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) echo 'ERROR: exact encrypted source asset was not published in time'; exit 1 ;; esac
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 "$asset_url" -o source.tar.gz.enc
+          test "$(shasum -a 256 source.tar.gz.enc | awk '{print $1}')" = "$SOURCE_CIPHER_SHA256"
+          node -e '
+            const crypto = require("crypto");
+            const fs = require("fs");
+            const payload = fs.readFileSync("source.tar.gz.enc");
+            if (payload.subarray(0, 8).toString("ascii") !== "SPINENC1" || payload.length < 36) throw new Error("invalid encrypted source envelope");
+            const key = Buffer.from(process.env.SOURCE_KEY_HEX, "hex");
+            const iv = payload.subarray(8, 20);
+            const tag = payload.subarray(20, 36);
+            const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+            decipher.setAuthTag(tag);
+            fs.writeFileSync("source.tar.gz", Buffer.concat([decipher.update(payload.subarray(36)), decipher.final()]), { mode: 0o400 });
+          '
+          unset SOURCE_KEY_HEX
+          rm -f source.tar.gz.enc
+          test "$(shasum -a 256 source.tar.gz | awk '{print $1}')" = "$SOURCE_PLAIN_SHA256"
+          mkdir source
+          tar -tzf source.tar.gz > source-entries.txt
+          node -e '
+            const fs = require("fs");
+            const entries = fs.readFileSync("source-entries.txt", "utf8").split(/\r?\n/).filter(Boolean);
+            if (!entries.length || !entries.includes("./.ci-source-manifest.json")) throw new Error("missing source manifest");
+            if (new Set(entries).size !== entries.length) throw new Error("duplicate source entries");
+            for (const entry of entries) {
+              if (entry.startsWith("/") || entry.split("/").includes("..")) throw new Error(`unsafe source entry: ${entry}`);
+            }
+          '
+          tar -xzf source.tar.gz --no-same-owner -C source
+          rm -f source.tar.gz source-entries.txt source-release.json
+      - name: Build credential-free unsigned archive
+        working-directory: source
+        run: ./tools/build-ios-unsigned.sh
+      - name: Upload credential-free handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: spin-unsigned-ios-${{ inputs.request_id }}
+          path: source/dist-unsigned-ios
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

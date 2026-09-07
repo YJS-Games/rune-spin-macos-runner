@@ -1,0 +1,51 @@
+name: Spin iOS Source Release Janitor
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  remove-stale-source-releases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete inactive stale draft releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = YJS-Games/rune-spin-macos-runner
+          cutoff="$(date -u -d '2 hours ago' +%s)"
+          gh api --paginate --slurp "/repos/$REPOSITORY/releases?per_page=100" > release-pages.json
+          gh api --paginate --slurp "/repos/$REPOSITORY/actions/workflows/spin-ios-unsigned.yml/runs?per_page=100" > run-pages.json
+          CUTOFF="$cutoff" node <<'NODE' > stale-release-ids.txt
+          const fs = require("fs");
+          const releases = JSON.parse(fs.readFileSync("release-pages.json", "utf8")).flat();
+          const runs = JSON.parse(fs.readFileSync("run-pages.json", "utf8")).flatMap((page) => page.workflow_runs || []);
+          const cutoff = Number(process.env.CUTOFF);
+          for (const release of releases) {
+            if (release.draft || !release.prerelease || !/^spin-ios-source-jenkins-[0-9]+-[0-9a-f-]{36}$/.test(release.tag_name || "")) continue;
+            if (release.name !== release.tag_name || Date.parse(release.created_at) / 1000 >= cutoff) continue;
+            const requestId = release.tag_name.slice("spin-ios-source-".length);
+            const active = runs.some((run) =>
+              run.display_title === `spin-ios-unsigned-${requestId}` &&
+              run.event === "workflow_dispatch" &&
+              run.path === ".github/workflows/spin-ios-unsigned.yml" &&
+              run.head_repository?.full_name === process.env.REPOSITORY &&
+              run.status !== "completed"
+            );
+            if (!active) process.stdout.write(`${release.id}\t${release.tag_name}\n`);
+          }
+          NODE
+          while IFS=$'\t' read -r release_id release_tag; do
+            case "$release_id" in ''|*[!0-9]*) exit 64 ;; esac
+            case "$release_tag" in spin-ios-source-jenkins-*) ;; *) exit 64 ;; esac
+            gh api --method DELETE "/repos/$REPOSITORY/releases/$release_id"
+            gh api --method DELETE "/repos/$REPOSITORY/git/refs/tags/$release_tag" || true
+          done < stale-release-ids.txt
