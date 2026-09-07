@@ -65,7 +65,8 @@ mkdir -p "$source_dir/packages" "$source_dir/phaser-packages" "$source_dir/vendo
 git -C "$SOURCE_CHECKOUT/packages" archive "$GAMEPACKAGES_COMMIT" | tar -x -C "$source_dir/packages"
 git -C "$SOURCE_CHECKOUT/phaser-packages" archive "$PHASERPACKAGES_COMMIT" | tar -x -C "$source_dir/phaser-packages"
 git -C "$SOURCE_CHECKOUT/vendor/playtest-platform" archive "$PLAYTEST_COMMIT" | tar -x -C "$source_dir/vendor/playtest-platform"
-SOURCE_MANIFEST="$source_dir/.ci-source-manifest.json" GAMEPACKAGES_COMMIT="$GAMEPACKAGES_COMMIT" PHASERPACKAGES_COMMIT="$PHASERPACKAGES_COMMIT" PLAYTEST_COMMIT="$PLAYTEST_COMMIT" node -e 'const fs=require("fs"); fs.writeFileSync(process.env.SOURCE_MANIFEST,JSON.stringify({format:1,commit:process.env.BUILD_COMMIT,submodules:{gamePackages:process.env.GAMEPACKAGES_COMMIT,phaserPackages:process.env.PHASERPACKAGES_COMMIT,playtestPlatform:process.env.PLAYTEST_COMMIT}})+"\n",{mode:0o400})'
+rm -f "$source_dir/.ci-source-manifest.json"
+SOURCE_MANIFEST="$source_dir/.ci-source-manifest.json" GAMEPACKAGES_COMMIT="$GAMEPACKAGES_COMMIT" PHASERPACKAGES_COMMIT="$PHASERPACKAGES_COMMIT" PLAYTEST_COMMIT="$PLAYTEST_COMMIT" node -e 'const fs=require("fs"),flags=fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,fd=fs.openSync(process.env.SOURCE_MANIFEST,flags,0o400); try{fs.writeFileSync(fd,JSON.stringify({format:1,commit:process.env.BUILD_COMMIT,submodules:{gamePackages:process.env.GAMEPACKAGES_COMMIT,phaserPackages:process.env.PHASERPACKAGES_COMMIT,playtestPlatform:process.env.PLAYTEST_COMMIT}})+"\n")}finally{fs.closeSync(fd)}; const stat=fs.lstatSync(process.env.SOURCE_MANIFEST); if(!stat.isFile()||stat.isSymbolicLink()) throw new Error("unsafe source manifest")'
 source_plain="$CONTROL_DIR/$source_release_tag.tar.gz"
 tar -czf "$source_plain" -C "$source_dir" .
 rm -rf "$source_dir"
