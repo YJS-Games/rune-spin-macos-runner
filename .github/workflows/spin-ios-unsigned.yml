@@ -27,7 +27,7 @@ permissions:
 jobs:
   unsigned-archive:
     runs-on: macos-15
-    timeout-minutes: 110
+    timeout-minutes: 150
     env:
       TRUSTED_GITHUB_MERGER: KorStrix
       LANG: en_US.UTF-8
@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v5
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v6
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
@@ -90,7 +90,8 @@ jobs:
           release_tag="spin-ios-source-$REQUEST_ID"
           handoff_asset_name="$release_tag.handoff.zip"
           handoff_asset_url=''
-          for attempt in $(seq 1 600); do
+          # Handoff contract: Jenkins key wait 20m + encryption 10m + release/upload/reconcile 17m < worker wait 90m.
+          for attempt in $(seq 1 1080); do
             gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > source-release.json 2>/dev/null || true
             HANDOFF_ASSET_NAME="$handoff_asset_name" node -e '
               const fs=require("fs");
