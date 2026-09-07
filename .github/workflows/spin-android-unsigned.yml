@@ -20,12 +20,12 @@ on:
         description: Unpredictable Jenkins request identity
         required: true
         type: string
-      source_release_tag:
-        description: Exact private runner release containing the source archive
+      source_plain_sha256:
+        description: SHA-256 of the decrypted source archive
         required: true
         type: string
-      source_archive_sha256:
-        description: SHA-256 of the private source archive
+      output_public_key:
+        description: Base64-encoded one-time Jenkins RSA public key for the unsigned artifacts
         required: true
         type: string
 
@@ -42,8 +42,8 @@ jobs:
       BUILD_NUMBER: ${{ inputs.build_number }}
       SPIN_VERSION_NAME: ${{ inputs.version_name }}
       REQUEST_ID: ${{ inputs.request_id }}
-      SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
-      SOURCE_ARCHIVE_SHA256: ${{ inputs.source_archive_sha256 }}
+      SOURCE_PLAIN_SHA256: ${{ inputs.source_plain_sha256 }}
+      OUTPUT_PUBLIC_KEY: ${{ inputs.output_public_key }}
       VITE_FIREBASE_ANALYTICS_ENABLED: "false"
       VITE_FIREBASE_API_KEY: AIzaSyBgeZX8b_1dPgejRWQBOYV7BWPq9ZsdCIo
       VITE_FIREBASE_AUTH_DOMAIN: spin-game-services-221126.firebaseapp.com
@@ -51,19 +51,19 @@ jobs:
       VITE_FIREBASE_APP_ID: 1:289090959480:web:fd37d951d9a0e59946d58d
       VITE_FIREBASE_MESSAGING_SENDER_ID: "289090959480"
     steps:
-      - name: Validate exact private handoff request
+      - name: Validate exact encrypted handoff request
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v7
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v8
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
           case "$BUILD_NUMBER" in ''|*[!0-9]*) exit 64 ;; esac
           case "$REQUEST_ID" in ''|*[!A-Za-z0-9._-]*) exit 64 ;; esac
-          case "$SOURCE_RELEASE_TAG" in spin-android-source-jenkins-*) ;; *) exit 64 ;; esac
-          case "$SOURCE_ARCHIVE_SHA256" in ''|*[!0-9a-f]*) exit 64 ;; esac
-          test "${#SOURCE_ARCHIVE_SHA256}" = 64
+          case "$SOURCE_PLAIN_SHA256" in ''|*[!0-9a-f]*) exit 64 ;; esac
+          test "${#SOURCE_PLAIN_SHA256}" = 64
+          test -n "$OUTPUT_PUBLIC_KEY"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
@@ -71,30 +71,74 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Download and verify exact private source archive
+      - name: Generate one-time source encryption keypair
+        run: |
+          set -euo pipefail
+          node -e '
+            const crypto = require("crypto");
+            const fs = require("fs");
+            const pair = crypto.generateKeyPairSync("rsa", {
+              modulusLength: 3072,
+              publicKeyEncoding: { type: "spki", format: "pem" },
+              privateKeyEncoding: { type: "pkcs8", format: "pem" },
+            });
+            fs.writeFileSync("source-private.pem", pair.privateKey, { mode: 0o400 });
+            fs.writeFileSync("source-public.pem", pair.publicKey, { mode: 0o400 });
+          '
+      - name: Publish run-scoped source encryption public key
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: spin-android-source-key-${{ inputs.request_id }}
+          path: source-public.pem
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Wait for, verify and decrypt exact source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" > source-release.json
-          SOURCE_RELEASE_TAG="$SOURCE_RELEASE_TAG" node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync("source-release.json","utf8")); const name=process.env.SOURCE_RELEASE_TAG+".tar.gz"; if(value.draft||!value.prerelease||value.tag_name!==process.env.SOURCE_RELEASE_TAG||value.name!==process.env.SOURCE_RELEASE_TAG||value.author?.login!==process.env.TRUSTED_GITHUB_MERGER) throw new Error("unexpected private source release"); const matches=(value.assets||[]).filter((asset)=>asset.name===name&&asset.state==="uploaded"); if(matches.length!==1) throw new Error("unexpected private source asset set"); process.stdout.write(matches[0].browser_download_url);' > source-url.txt
-          source_url="$(cat source-url.txt)"
-          case "$source_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) exit 1 ;; esac
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" "$source_url" -o source.tar.gz
-          test "$(shasum -a 256 source.tar.gz | awk '{print $1}')" = "$SOURCE_ARCHIVE_SHA256"
+          release_tag="spin-android-source-$REQUEST_ID"
+          handoff_asset_name="$release_tag.handoff.zip"
+          handoff_asset_url=''
+          for attempt in $(seq 1 1080); do
+            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > source-release.json 2>/dev/null || true
+            HANDOFF_ASSET_NAME="$handoff_asset_name" node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync("source-release.json","utf8")||"{}"); const matches=(value.assets||[]).filter((v)=>v.name===process.env.HANDOFF_ASSET_NAME&&v.state==="uploaded"); if(matches.length>1) throw new Error("duplicate encrypted handoff assets"); fs.writeFileSync("source-asset-url.txt",matches.length===1?matches[0].browser_download_url:"");'
+            handoff_asset_url="$(cat source-asset-url.txt)"
+            [ -n "$handoff_asset_url" ] && break
+            sleep 5
+          done
+          case "$handoff_asset_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) echo 'ERROR: exact encrypted handoff asset was not published in time'; exit 1 ;; esac
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 900 "$handoff_asset_url" -o source-handoff.zip
+          expected_entries="$(printf '%s\n' "$release_tag.key.enc" "$release_tag.tar.gz.enc" | LC_ALL=C sort)"
+          test "$(unzip -Z1 source-handoff.zip | LC_ALL=C sort)" = "$expected_entries"
+          unzip -p source-handoff.zip "$release_tag.tar.gz.enc" > source.tar.gz.enc
+          unzip -p source-handoff.zip "$release_tag.key.enc" > source-key.enc
+          node -e 'const crypto=require("crypto"); const fs=require("fs"); const payload=fs.readFileSync("source.tar.gz.enc"); if(payload.subarray(0,8).toString("ascii")!=="SPINENC1"||payload.length<36) throw new Error("invalid encrypted source envelope"); const key=crypto.privateDecrypt({key:fs.readFileSync("source-private.pem"),padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:"sha256"},fs.readFileSync("source-key.enc")); if(key.length!==32) throw new Error("invalid unwrapped source key"); const decipher=crypto.createDecipheriv("aes-256-gcm",key,payload.subarray(8,20)); decipher.setAuthTag(payload.subarray(20,36)); fs.writeFileSync("source.tar.gz",Buffer.concat([decipher.update(payload.subarray(36)),decipher.final()]),{mode:0o400});'
+          rm -f source-handoff.zip source.tar.gz.enc source-key.enc source-private.pem source-public.pem
+          test "$(shasum -a 256 source.tar.gz | awk '{print $1}')" = "$SOURCE_PLAIN_SHA256"
           tar -tzf source.tar.gz > source-entries.txt
           node -e 'const fs=require("fs"); const entries=fs.readFileSync("source-entries.txt","utf8").split(/\r?\n/).filter(Boolean); if(!entries.length||new Set(entries).size!==entries.length) throw new Error("invalid source archive entries"); for(const entry of entries){if(entry.startsWith("/")||entry.split("/").includes("..")) throw new Error(`unsafe source entry: ${entry}`);}'
           mkdir source
           tar -xzf source.tar.gz --no-same-owner -C source
-          rm -f source.tar.gz source-entries.txt source-release.json source-url.txt
+          rm -f source.tar.gz source-entries.txt source-release.json source-asset-url.txt
       - name: Build credential-free unsigned Android artifacts
         working-directory: source
         run: ./tools/build-android-unsigned.sh
-      - name: Upload private unsigned handoff
+      - name: Encrypt unsigned Android artifacts for Jenkins
+        run: |
+          set -euo pipefail
+          (cd source/dist-unsigned-android && zip -q -0 ../android-output.zip unsigned.aab unsigned.apk unsigned.aab.sha256 unsigned.apk.sha256 artifact-metadata.json)
+          printf '%s' "$OUTPUT_PUBLIC_KEY" | base64 --decode > output-public.pem
+          node -e 'const crypto=require("crypto"); const fs=require("fs"); const publicKey=crypto.createPublicKey(fs.readFileSync("output-public.pem")); if(publicKey.asymmetricKeyType!=="rsa"||publicKey.asymmetricKeyDetails?.modulusLength!==3072) throw new Error("unexpected Jenkins output public key"); const plain=fs.readFileSync("source/android-output.zip"); const key=crypto.randomBytes(32); const iv=crypto.randomBytes(12); const cipher=crypto.createCipheriv("aes-256-gcm",key,iv); const encrypted=Buffer.concat([cipher.update(plain),cipher.final()]); fs.writeFileSync("android-output.zip.enc",Buffer.concat([Buffer.from("SPINENC1","ascii"),iv,cipher.getAuthTag(),encrypted]),{mode:0o400}); fs.writeFileSync("android-output.key.enc",crypto.publicEncrypt({key:publicKey,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:"sha256"},key),{mode:0o400});'
+          rm -rf output-public.pem source/android-output.zip source/dist-unsigned-android
+      - name: Upload encrypted unsigned handoff
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: spin-unsigned-android-${{ inputs.request_id }}
-          path: source/dist-unsigned-android
+          path: |
+            android-output.zip.enc
+            android-output.key.enc
           if-no-files-found: error
           retention-days: 1
           compression-level: 0

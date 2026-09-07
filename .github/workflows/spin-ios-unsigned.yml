@@ -20,6 +20,10 @@ on:
         description: SHA-256 of the decrypted source archive
         required: true
         type: string
+      output_public_key:
+        description: Base64-encoded one-time Jenkins RSA public key for the unsigned archive
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -38,6 +42,7 @@ jobs:
       BUILD_NUMBER: ${{ inputs.build_number }}
       REQUEST_ID: ${{ inputs.request_id }}
       SOURCE_PLAIN_SHA256: ${{ inputs.source_plain_sha256 }}
+      OUTPUT_PUBLIC_KEY: ${{ inputs.output_public_key }}
       VITE_FIREBASE_ANALYTICS_ENABLED: "false"
       VITE_FIREBASE_API_KEY: AIzaSyBgeZX8b_1dPgejRWQBOYV7BWPq9ZsdCIo
       VITE_FIREBASE_AUTH_DOMAIN: spin-game-services-221126.firebaseapp.com
@@ -49,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v7
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v8
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
@@ -57,6 +62,7 @@ jobs:
           case "$REQUEST_ID" in ''|*[!A-Za-z0-9._-]*) exit 64 ;; esac
           case "$SOURCE_PLAIN_SHA256" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#SOURCE_PLAIN_SHA256}" = 64
+          test -n "$OUTPUT_PUBLIC_KEY"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
@@ -142,6 +148,27 @@ jobs:
       - name: Build credential-free unsigned archive
         working-directory: source
         run: ./tools/build-ios-unsigned.sh
+      - name: Encrypt unsigned archive for Jenkins
+        run: |
+          set -euo pipefail
+          printf '%s' "$OUTPUT_PUBLIC_KEY" | base64 --decode > output-public.pem
+          node -e '
+            const crypto = require("crypto");
+            const fs = require("fs");
+            const publicKey = crypto.createPublicKey(fs.readFileSync("output-public.pem"));
+            if (publicKey.asymmetricKeyType !== "rsa" || publicKey.asymmetricKeyDetails?.modulusLength !== 3072) throw new Error("unexpected Jenkins output public key");
+            const plain = fs.readFileSync("source/dist-unsigned-ios/App.xcarchive.zip");
+            const key = crypto.randomBytes(32);
+            const iv = crypto.randomBytes(12);
+            const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+            const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
+            const envelope = Buffer.concat([Buffer.from("SPINENC1", "ascii"), iv, cipher.getAuthTag(), encrypted]);
+            const wrapped = crypto.publicEncrypt({key:publicKey,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:"sha256"}, key);
+            fs.writeFileSync("source/dist-unsigned-ios/App.xcarchive.zip.enc", envelope, { mode: 0o400 });
+            fs.writeFileSync("source/dist-unsigned-ios/App.xcarchive.key.enc", wrapped, { mode: 0o400 });
+          '
+          rm -f output-public.pem source/dist-unsigned-ios/App.xcarchive.zip
+          test "$(find source/dist-unsigned-ios -type f | wc -l | tr -d ' ')" = 3
       - name: Upload credential-free handoff
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
