@@ -56,17 +56,23 @@ jobs:
           while IFS=$'\t' read -r release_id release_tag; do
             case "$release_id" in -) ;; ''|*[!0-9]*) cleanup_status=1; continue ;; *) ;; esac
             case "$release_tag" in spin-ios-source-jenkins-*) ;; *) exit 64 ;; esac
+            set +e
             tag_status="$(curl -sS -o tag-delete-response.json -w '%{http_code}' -X DELETE \
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2022-11-28' \
               "https://api.github.com/repos/$REPOSITORY/git/refs/tags/$release_tag")"
-            case "$tag_status" in 204|404) ;; *) echo "tag cleanup failed for $release_tag: HTTP $tag_status"; cleanup_status=1 ;; esac
+            tag_curl_status=$?
+            set -e
+            case "$tag_curl_status:$tag_status" in 0:204|0:404) ;; *) echo "tag cleanup failed for $release_tag: curl=$tag_curl_status HTTP=$tag_status"; cleanup_status=1 ;; esac
             if [ "$release_id" != - ]; then
+              set +e
               release_status="$(curl -sS -o release-delete-response.json -w '%{http_code}' -X DELETE \
                 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
                 -H 'X-GitHub-Api-Version: 2022-11-28' \
                 "https://api.github.com/repos/$REPOSITORY/releases/$release_id")"
-              case "$release_status" in 204|404) ;; *) echo "release cleanup failed for $release_tag: HTTP $release_status"; cleanup_status=1 ;; esac
+              release_curl_status=$?
+              set -e
+              case "$release_curl_status:$release_status" in 0:204|0:404) ;; *) echo "release cleanup failed for $release_tag: curl=$release_curl_status HTTP=$release_status"; cleanup_status=1 ;; esac
             fi
           done < stale-handoffs.txt
           exit "$cleanup_status"
