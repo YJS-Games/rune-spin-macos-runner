@@ -23,39 +23,41 @@ jobs:
           test "$REPOSITORY" = YJS-Games/rune-spin-macos-runner
           cutoff="$(date -u -d '2 hours ago' +%s)"
           gh api --paginate --slurp "/repos/$REPOSITORY/releases?per_page=100" > release-pages.json
-          gh api --paginate --slurp "/repos/$REPOSITORY/git/matching-refs/tags/spin-ios-source-jenkins-?per_page=100" > tag-pages.json
-          gh api --paginate --slurp "/repos/$REPOSITORY/actions/workflows/spin-ios-unsigned.yml/runs?per_page=100" > run-pages.json
+          gh api --paginate --slurp "/repos/$REPOSITORY/git/matching-refs/tags/spin-ios-source-jenkins-?per_page=100" > ios-tag-pages.json
+          gh api --paginate --slurp "/repos/$REPOSITORY/git/matching-refs/tags/spin-android-source-jenkins-?per_page=100" > android-tag-pages.json
+          gh api --paginate --slurp "/repos/$REPOSITORY/actions/workflows/spin-ios-unsigned.yml/runs?per_page=100" > ios-run-pages.json
+          gh api --paginate --slurp "/repos/$REPOSITORY/actions/workflows/spin-android-unsigned.yml/runs?per_page=100" > android-run-pages.json
           CUTOFF="$cutoff" node <<'NODE' > stale-handoffs.txt
           const fs = require("fs");
           const releases = JSON.parse(fs.readFileSync("release-pages.json", "utf8")).flat();
-          const refs = JSON.parse(fs.readFileSync("tag-pages.json", "utf8")).flat();
-          const runs = JSON.parse(fs.readFileSync("run-pages.json", "utf8")).flatMap((page) => page.workflow_runs || []);
+          const refs = ["ios-tag-pages.json", "android-tag-pages.json"].flatMap((path) => JSON.parse(fs.readFileSync(path, "utf8")).flat());
+          const runs = ["ios-run-pages.json", "android-run-pages.json"].flatMap((path) => JSON.parse(fs.readFileSync(path, "utf8")).flatMap((page) => page.workflow_runs || []));
           const cutoff = Number(process.env.CUTOFF);
           const releaseTags = new Set(releases.map((release) => release.tag_name));
-          const isActive = (requestId) => runs.some((run) =>
-            run.display_title === `spin-ios-unsigned-${requestId}` &&
+          const isActive = (platform, requestId) => runs.some((run) =>
+            run.display_title === `spin-${platform}-unsigned-${requestId}` &&
             run.event === "workflow_dispatch" &&
-            run.path === ".github/workflows/spin-ios-unsigned.yml" &&
+            run.path === `.github/workflows/spin-${platform}-unsigned.yml` &&
             run.head_repository?.full_name === process.env.REPOSITORY &&
             run.status !== "completed"
           );
           for (const release of releases) {
-            if (release.draft || !release.prerelease || !/^spin-ios-source-jenkins-[0-9]+-[0-9a-f-]{36}$/.test(release.tag_name || "")) continue;
+            const match = /^spin-(ios|android)-source-(jenkins-[0-9]+-[0-9a-f-]{36})$/.exec(release.tag_name || "");
+            if (release.draft || !release.prerelease || !match) continue;
             if (release.name !== release.tag_name || Date.parse(release.created_at) / 1000 >= cutoff) continue;
-            const requestId = release.tag_name.slice("spin-ios-source-".length);
-            if (!isActive(requestId)) process.stdout.write(`${release.id}\t${release.tag_name}\n`);
+            if (!isActive(match[1], match[2])) process.stdout.write(`${release.id}\t${release.tag_name}\n`);
           }
           for (const ref of refs) {
             const releaseTag = String(ref.ref || "").replace(/^refs\/tags\//, "");
-            if (!/^spin-ios-source-jenkins-[0-9]+-[0-9a-f-]{36}$/.test(releaseTag) || releaseTags.has(releaseTag)) continue;
-            const requestId = releaseTag.slice("spin-ios-source-".length);
-            if (!isActive(requestId)) process.stdout.write(`-\t${releaseTag}\n`);
+            const match = /^spin-(ios|android)-source-(jenkins-[0-9]+-[0-9a-f-]{36})$/.exec(releaseTag);
+            if (!match || releaseTags.has(releaseTag)) continue;
+            if (!isActive(match[1], match[2])) process.stdout.write(`-\t${releaseTag}\n`);
           }
           NODE
           cleanup_status=0
           while IFS=$'\t' read -r release_id release_tag; do
             case "$release_id" in -) ;; ''|*[!0-9]*) cleanup_status=1; continue ;; *) ;; esac
-            case "$release_tag" in spin-ios-source-jenkins-*) ;; *) exit 64 ;; esac
+            case "$release_tag" in spin-ios-source-jenkins-*|spin-android-source-jenkins-*) ;; *) exit 64 ;; esac
             set +e
             tag_status="$(curl -sS -o tag-delete-response.json -w '%{http_code}' -X DELETE \
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
