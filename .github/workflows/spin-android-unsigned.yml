@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v9
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v10
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
