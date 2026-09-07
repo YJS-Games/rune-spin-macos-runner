@@ -46,6 +46,6 @@ jobs:
           while IFS=$'\t' read -r release_id release_tag; do
             case "$release_id" in ''|*[!0-9]*) exit 64 ;; esac
             case "$release_tag" in spin-ios-source-jenkins-*) ;; *) exit 64 ;; esac
+            gh api --method DELETE "/repos/$REPOSITORY/git/refs/tags/$release_tag"
             gh api --method DELETE "/repos/$REPOSITORY/releases/$release_id"
-            gh api --method DELETE "/repos/$REPOSITORY/git/refs/tags/$release_tag" || true
           done < stale-release-ids.txt

@@ -22,12 +22,12 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   unsigned-archive:
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       TRUSTED_GITHUB_MERGER: KorStrix
       LANG: en_US.UTF-8
@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v2
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v3
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
@@ -60,12 +60,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
-      - name: Publish one-time encryption public key
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Generate one-time encryption keypair
         run: |
           set -euo pipefail
-          release_tag="spin-ios-source-$REQUEST_ID"
           node -e '
             const crypto = require("crypto");
             const fs = require("fs");
@@ -77,12 +74,14 @@ jobs:
             fs.writeFileSync("source-private.pem", pair.privateKey, { mode: 0o400 });
             fs.writeFileSync("source-public.pem", pair.publicKey, { mode: 0o400 });
           '
-          gh release create "$release_tag" source-public.pem \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$release_tag" \
-            --prerelease \
-            --notes "Ephemeral public key for $REQUEST_ID"
+      - name: Publish run-scoped encryption public key
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: spin-ios-source-key-${{ inputs.request_id }}
+          path: source-public.pem
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
       - name: Wait for, verify and decrypt exact source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,7 +92,7 @@ jobs:
           key_asset_name="$release_tag.key.enc"
           source_asset_url=''
           key_asset_url=''
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 480); do
             gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > source-release.json 2>/dev/null || true
             SOURCE_ASSET_NAME="$source_asset_name" KEY_ASSET_NAME="$key_asset_name" node -e '
               const fs=require("fs");
