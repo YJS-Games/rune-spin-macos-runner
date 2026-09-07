@@ -27,7 +27,7 @@ permissions:
 jobs:
   unsigned-archive:
     runs-on: macos-15
-    timeout-minutes: 75
+    timeout-minutes: 110
     env:
       TRUSTED_GITHUB_MERGER: KorStrix
       LANG: en_US.UTF-8
@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = YJS-Games/rune-spin-macos-runner
-          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v3
+          test "$GITHUB_REF" = refs/tags/spin-ios-unsigned-v4
           test "$GITHUB_ACTOR" = "$TRUSTED_GITHUB_MERGER"
           case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
           test "${#BUILD_COMMIT}" = 40
@@ -88,30 +88,28 @@ jobs:
         run: |
           set -euo pipefail
           release_tag="spin-ios-source-$REQUEST_ID"
-          source_asset_name="$release_tag.tar.gz.enc"
-          key_asset_name="$release_tag.key.enc"
-          source_asset_url=''
-          key_asset_url=''
-          for attempt in $(seq 1 480); do
+          handoff_asset_name="$release_tag.handoff.zip"
+          handoff_asset_url=''
+          for attempt in $(seq 1 600); do
             gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > source-release.json 2>/dev/null || true
-            SOURCE_ASSET_NAME="$source_asset_name" KEY_ASSET_NAME="$key_asset_name" node -e '
+            HANDOFF_ASSET_NAME="$handoff_asset_name" node -e '
               const fs=require("fs");
               const value=JSON.parse(fs.readFileSync("source-release.json","utf8")||"{}");
-              const expected=new Set([process.env.SOURCE_ASSET_NAME,process.env.KEY_ASSET_NAME]);
-              const matches=(value.assets||[]).filter((v)=>expected.has(v.name)&&v.state==="uploaded");
-              for(const name of expected){if(matches.filter((v)=>v.name===name).length>1) throw new Error(`duplicate source asset: ${name}`);}
-              const found=Object.fromEntries(matches.map((v)=>[v.name,v.browser_download_url]));
-              fs.writeFileSync("source-asset-urls.json",JSON.stringify(found));
+              const matches=(value.assets||[]).filter((v)=>v.name===process.env.HANDOFF_ASSET_NAME&&v.state==="uploaded");
+              if(matches.length>1) throw new Error("duplicate encrypted handoff assets");
+              fs.writeFileSync("source-asset-url.txt",matches.length===1?matches[0].browser_download_url:"");
             '
-            source_asset_url="$(SOURCE_ASSET_NAME="$source_asset_name" node -p 'JSON.parse(require("fs").readFileSync("source-asset-urls.json","utf8"))[process.env.SOURCE_ASSET_NAME] || ""')"
-            key_asset_url="$(KEY_ASSET_NAME="$key_asset_name" node -p 'JSON.parse(require("fs").readFileSync("source-asset-urls.json","utf8"))[process.env.KEY_ASSET_NAME] || ""')"
-            [ -n "$source_asset_url" ] && [ -n "$key_asset_url" ] && break
+            handoff_asset_url="$(cat source-asset-url.txt)"
+            [ -n "$handoff_asset_url" ] && break
             sleep 5
           done
-          case "$source_asset_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) echo 'ERROR: exact encrypted source asset was not published in time'; exit 1 ;; esac
-          case "$key_asset_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) echo 'ERROR: exact wrapped key asset was not published in time'; exit 1 ;; esac
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 "$source_asset_url" -o source.tar.gz.enc
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 "$key_asset_url" -o source-key.enc
+          case "$handoff_asset_url" in https://github.com/YJS-Games/rune-spin-macos-runner/releases/download/*) ;; *) echo 'ERROR: exact encrypted handoff asset was not published in time'; exit 1 ;; esac
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 "$handoff_asset_url" -o source-handoff.zip
+          expected_entries="$(printf '%s\n' "$release_tag.key.enc" "$release_tag.tar.gz.enc" | LC_ALL=C sort)"
+          test "$(unzip -Z1 source-handoff.zip | LC_ALL=C sort)" = "$expected_entries"
+          unzip -p source-handoff.zip "$release_tag.tar.gz.enc" > source.tar.gz.enc
+          unzip -p source-handoff.zip "$release_tag.key.enc" > source-key.enc
+          rm -f source-handoff.zip
           node -e '
             const crypto = require("crypto");
             const fs = require("fs");
@@ -139,7 +137,7 @@ jobs:
             }
           '
           tar -xzf source.tar.gz --no-same-owner -C source
-          rm -f source.tar.gz source-entries.txt source-release.json source-asset-urls.json
+          rm -f source.tar.gz source-entries.txt source-release.json source-asset-url.txt
       - name: Build credential-free unsigned archive
         working-directory: source
         run: ./tools/build-ios-unsigned.sh
