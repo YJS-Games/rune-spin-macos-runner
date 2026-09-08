@@ -46,11 +46,29 @@ cleanup_request() {
   cleanup_failures="${cleanup_failures}${method} ${url} transport=${transport_status} http=${http_code}\n"
   return 1
 }
+refresh_run_completed() {
+  [ -n "$run_id" ] || return 1
+  run_status_file="$CONTROL_DIR/cleanup-run-status.json"
+  if github_api "$api_base/actions/runs/$run_id" > "$run_status_file"; then
+    observed_status="$(RUN_STATUS_FILE="$run_status_file" node -p 'JSON.parse(require("fs").readFileSync(process.env.RUN_STATUS_FILE,"utf8")).status')"
+    rm -f "$run_status_file"
+    if [ "$observed_status" = completed ]; then
+      run_completed='true'
+      return 0
+    fi
+  else
+    rm -f "$run_status_file"
+  fi
+  return 1
+}
 cleanup() {
   status=$?
   trap - EXIT
   set +e
   cleanup_failed=0
+  if [ -n "$run_id" ] && [ "$run_completed" != true ]; then
+    refresh_run_completed || true
+  fi
   if [ -n "$run_id" ] && [ "$run_completed" != true ]; then
     cleanup_request POST "$api_base/actions/runs/$run_id/cancel" || cleanup_failed=1
   fi
