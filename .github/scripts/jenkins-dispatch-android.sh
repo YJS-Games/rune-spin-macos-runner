@@ -7,8 +7,14 @@ required=(BUILD_COMMIT BUILD_NUMBER SPIN_VERSION_NAME ANDROID_UNSIGNED_REQUEST_I
 for name in "${required[@]}"; do
   test -n "${!name:-}" || { echo "ERROR: missing $name" >&2; exit 64; }
 done
-case "$CONTROL_DIR" in /Users/yj/.jenkins/spin-android-control/Spin-AOS-AAB/spin-android-control-*) ;; *) exit 64 ;; esac
+run_root="$(dirname "$CONTROL_DIR")"
+case "$run_root" in /Users/yj/.jenkins/spin-android-runs/Spin-AOS-AAB/spin-android-run-*) ;; *) exit 64 ;; esac
+test "$CONTROL_DIR" = "$run_root/control"
+test "$SOURCE_CHECKOUT" = "$run_root/source"
 test -d "$CONTROL_DIR" && test ! -L "$CONTROL_DIR" && test -O "$CONTROL_DIR"
+test -d "$SOURCE_CHECKOUT" && test ! -L "$SOURCE_CHECKOUT" && test -O "$SOURCE_CHECKOUT"
+test -z "${GIT_OBJECT_DIRECTORY:-}${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}${GIT_REPLACE_REF_BASE:-}"
+export GIT_NO_REPLACE_OBJECTS=1
 case "$BUILD_COMMIT" in ''|*[!0-9a-f]*) exit 64 ;; esac
 test "${#BUILD_COMMIT}" = 40
 case "$BUILD_NUMBER" in ''|*[!0-9]*) exit 64 ;; esac
@@ -22,25 +28,42 @@ github_api() {
       -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$1"
 }
 run_id=''
+run_completed='false'
 source_release_id=''
 source_release_tag="spin-android-source-$ANDROID_UNSIGNED_REQUEST_ID"
+recovery_journal="$run_root/recovery-journal.json"
+cleanup_failures=''
+cleanup_request() {
+  method="$1"
+  url="$2"
+  http_code="$(printf 'user = "%s:%s"\n' "$GITHUB_API_USER" "$GITHUB_API_TOKEN" |
+    curl --config - -sS -o /dev/null -w '%{http_code}' -X "$method" \
+      -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$url")"
+  transport_status=$?
+  case "$transport_status:$http_code" in
+    0:2??|0:404) return 0 ;;
+  esac
+  cleanup_failures="${cleanup_failures}${method} ${url} transport=${transport_status} http=${http_code}\n"
+  return 1
+}
 cleanup() {
   status=$?
   trap - EXIT
   set +e
-  if [ -n "$run_id" ]; then
-    printf 'user = "%s:%s"\n' "$GITHUB_API_USER" "$GITHUB_API_TOKEN" |
-      curl --config - -sS -o /dev/null -X POST -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' "$api_base/actions/runs/$run_id/cancel" || true
+  cleanup_failed=0
+  if [ -n "$run_id" ] && [ "$run_completed" != true ]; then
+    cleanup_request POST "$api_base/actions/runs/$run_id/cancel" || cleanup_failed=1
   fi
   if [ -n "$source_release_id" ]; then
-    printf 'user = "%s:%s"\n' "$GITHUB_API_USER" "$GITHUB_API_TOKEN" |
-      curl --config - -sS -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' "$api_base/releases/$source_release_id" || status=1
+    cleanup_request DELETE "$api_base/releases/$source_release_id" || cleanup_failed=1
   fi
-  printf 'user = "%s:%s"\n' "$GITHUB_API_USER" "$GITHUB_API_TOKEN" |
-    curl --config - -sS -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' "$api_base/git/refs/tags/$source_release_tag" || status=1
+  cleanup_request DELETE "$api_base/git/refs/tags/$source_release_tag" || cleanup_failed=1
+  if [ "$cleanup_failed" -ne 0 ]; then
+    CLEANUP_FAILURES="$cleanup_failures" RUN_ID="$run_id" SOURCE_RELEASE_ID="$source_release_id" SOURCE_RELEASE_TAG="$source_release_tag" ORIGINAL_STATUS="$status" RECOVERY_JOURNAL="$recovery_journal" node -e 'const fs=require("fs"); const value={format:1,createdAt:new Date().toISOString(),runId:process.env.RUN_ID||null,sourceReleaseId:process.env.SOURCE_RELEASE_ID||null,sourceReleaseTag:process.env.SOURCE_RELEASE_TAG,originalStatus:Number(process.env.ORIGINAL_STATUS),failures:process.env.CLEANUP_FAILURES.trim().split(/\n/).filter(Boolean)}; fs.writeFileSync(process.env.RECOVERY_JOURNAL,JSON.stringify(value)+"\n",{mode:0o400,flag:"wx"})' || true
+    echo "ERROR: remote cleanup incomplete; recovery journal preserved at $recovery_journal" >&2
+    exit 1
+  fi
+  rm -f "$recovery_journal"
   cd /
   rm -rf "$CONTROL_DIR" || status=1
   exit "$status"
@@ -57,10 +80,25 @@ github_api "$api_base/actions/workflows/spin-ios-source-janitor.yml/runs?per_pag
 node -e 'const fs=require("fs"),v=JSON.parse(fs.readFileSync("janitor-runs.json","utf8")); if(!(v.workflow_runs||[]).some((r)=>r.head_sha===process.env.TRUSTED_CI_REVISION&&r.path===".github/workflows/spin-ios-source-janitor.yml"&&r.status==="completed"&&r.conclusion==="success"&&Date.parse(r.updated_at)>=Date.now()-48*60*60*1000)) throw new Error("no recent exact-revision janitor success")'
 
 source_dir="$(mktemp -d "$CONTROL_DIR/source.XXXXXX")"
-git -C "$SOURCE_CHECKOUT" archive "$BUILD_COMMIT" | tar -x -C "$source_dir"
+assert_repository_boundary() {
+  repository="$1"
+  expected_commit="$2"
+  test "$(git -C "$repository" rev-parse --is-inside-work-tree)" = true
+  test "$(git -C "$repository" rev-parse HEAD)" = "$expected_commit"
+  test -z "$(git -C "$repository" for-each-ref --format='%(refname)' refs/replace/)"
+  git_dir="$(git -C "$repository" rev-parse --absolute-git-dir)"
+  test ! -e "$git_dir/info/grafts" && test ! -L "$git_dir/info/grafts"
+  test ! -e "$git_dir/objects/info/alternates" && test ! -L "$git_dir/objects/info/alternates"
+  test -z "$(git -C "$repository" config --show-origin --get-all core.alternateRefsCommand || true)"
+}
+assert_repository_boundary "$SOURCE_CHECKOUT" "$BUILD_COMMIT"
 GAMEPACKAGES_COMMIT="$(git -C "$SOURCE_CHECKOUT" ls-tree "$BUILD_COMMIT" packages | awk '{print $3}')"
 PHASERPACKAGES_COMMIT="$(git -C "$SOURCE_CHECKOUT" ls-tree "$BUILD_COMMIT" phaser-packages | awk '{print $3}')"
 PLAYTEST_COMMIT="$(git -C "$SOURCE_CHECKOUT" ls-tree "$BUILD_COMMIT" vendor/playtest-platform | awk '{print $3}')"
+assert_repository_boundary "$SOURCE_CHECKOUT/packages" "$GAMEPACKAGES_COMMIT"
+assert_repository_boundary "$SOURCE_CHECKOUT/phaser-packages" "$PHASERPACKAGES_COMMIT"
+assert_repository_boundary "$SOURCE_CHECKOUT/vendor/playtest-platform" "$PLAYTEST_COMMIT"
+git -C "$SOURCE_CHECKOUT" archive "$BUILD_COMMIT" | tar -x -C "$source_dir"
 mkdir -p "$source_dir/packages" "$source_dir/phaser-packages" "$source_dir/vendor/playtest-platform"
 git -C "$SOURCE_CHECKOUT/packages" archive "$GAMEPACKAGES_COMMIT" | tar -x -C "$source_dir/packages"
 git -C "$SOURCE_CHECKOUT/phaser-packages" archive "$PHASERPACKAGES_COMMIT" | tar -x -C "$source_dir/phaser-packages"
@@ -125,7 +163,10 @@ test "$upload_status" = 201
 
 for attempt in $(seq 1 1440); do
   github_api "$api_base/actions/runs/$run_id" > run.json
-  [ "$(node -p 'JSON.parse(require("fs").readFileSync("run.json","utf8")).status')" = completed ] && break
+  if [ "$(node -p 'JSON.parse(require("fs").readFileSync("run.json","utf8")).status')" = completed ]; then
+    run_completed='true'
+    break
+  fi
   sleep 5
 done
 test "$(node -p 'JSON.parse(require("fs").readFileSync("run.json","utf8")).conclusion')" = success
